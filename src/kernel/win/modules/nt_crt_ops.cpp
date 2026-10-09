@@ -31,6 +31,39 @@ void modules::register_ntoskrnl_crt_ops(win_kernel_state& state, proc_module& mo
 		return str.size();
 	});
 
+	// Pointer-returning like strchr: the answer must live in the guest's own buffer.
+	state.redirect(mod, "wcschr",
+		[](vcpu& cpu, const addr_t str, const std::uint16_t c) -> addr_t
+		{
+			if (!str)
+				return 0;
+
+			auto& space = *cpu.curr_addr_space();
+
+			for (addr_t at = str; ; at += sizeof(char16_t))
+			{
+				const auto ch = space.read_mem<char16_t>(at);
+
+				if (ch == static_cast<char16_t>(c))
+					return at;
+
+				if (!ch)
+					return 0;
+			}
+		});
+
+	state.redirect(mod, "_wcsnicmp",
+		[](vcpu&, std::u16string str1, std::u16string str2, const std::uint64_t count) -> std::int32_t
+		{
+			const auto r = compare_ascii_nocase(str1.data(), str2.data(),
+				std::min<std::size_t>(count, std::min(str1.size(), str2.size()) + 1));
+
+			THREAD_LOG_INFO("_wcsnicmp('{}', '{}', {}) -> {}",
+				narrow_wstring(str1), narrow_wstring(str2), count, r);
+
+			return r;
+		});
+
 	state.redirect(mod, "strcmp",
 		[](vcpu&, std::string str1, std::string str2) -> std::int32_t
 		{

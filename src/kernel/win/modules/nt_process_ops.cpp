@@ -422,6 +422,18 @@ void modules::register_ntoskrnl_process_ops(win_kernel_state& state, proc_module
 			return remove_notify(notify->image, "PsRemoveLoadImageNotifyRoutine", notify_routine);
 		});
 
+	// The Ex form only adds reserved flags on top of the same registration list;
+	// NEProtect resolves it at runtime and passes flags=0x1.
+	state.redirect(mod, "PsSetLoadImageNotifyRoutineEx",
+		[notify](vcpu&, const addr_t notify_routine, const std::uint32_t flags) -> NTSTATUS
+		{
+			THREAD_LOG_INFO("PsSetLoadImageNotifyRoutineEx(0x{:X}): flags=0x{:X}",
+				notify_routine, flags);
+
+			return add_notify(notify->image, max_image_notify_routines,
+				"PsSetLoadImageNotifyRoutineEx", notify_routine);
+		});
+
 	// There is one address space here, so a driver reading the target's memory gets its own.
 	auto apc_state_of = [](vcpu& cpu) -> emu_object<_KAPC_STATE>
 	{

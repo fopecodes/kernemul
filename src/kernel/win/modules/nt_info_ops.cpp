@@ -212,6 +212,57 @@ void modules::register_ntoskrnl_info_ops(win_kernel_state& state, proc_module& m
 		return id;
 	});
 
+	// The thread's CID holds the owning process id; the pointer is a guest ETHREAD.
+	state.redirect(mod, "PsGetThreadProcessId",
+		[](vcpu&, emu_object<_ETHREAD> thread) -> addr_t
+		{
+			if (!thread)
+			{
+				THREAD_LOG_WARN("PsGetThreadProcessId: null thread");
+				return 0;
+			}
+
+			const auto id = guest_va(thread.field(&_ETHREAD::Cid).field(&_CLIENT_ID::UniqueProcess).read());
+
+			THREAD_LOG_INFO("PsGetThreadProcessId(0x{:X}) -> {}", thread.address(), id);
+
+			return id;
+		});
+
+	// The guest kernel here is 26100, so the CSD string has been empty since XP
+	// stopped naming service packs.
+	state.redirect(mod, "PsGetVersion",
+		[](vcpu&, emu_object<std::uint32_t> major_version,
+			emu_object<std::uint32_t> minor_version, emu_object<std::uint32_t> build_number,
+			emu_object<_UNICODE_STRING> csd_version) -> std::uint8_t
+		{
+			if (major_version)
+				major_version.write(10);
+
+			if (minor_version)
+				minor_version.write(0);
+
+			if (build_number)
+				build_number.write(26100);
+
+			if (csd_version)
+				csd_version.write(_UNICODE_STRING{});
+
+			THREAD_LOG_INFO("PsGetVersion() -> 10.0.26100");
+
+			return 1;
+		});
+
+	state.redirect(mod, "RtlIsNtDdiVersionAvailable",
+		[](vcpu&, const std::uint32_t version) -> std::uint8_t
+		{
+			// 26100 satisfies every NTDDI level a downlevel check can name today; the
+			// request is logged so a level that is not satisfied shows up in the trace.
+			THREAD_LOG_INFO("RtlIsNtDdiVersionAvailable(0x{:X}) -> 1", version);
+
+			return 1;
+		});
+
 	state.redirect(mod, "RtlGetVersion",
 		[st](vcpu& cpu, emu_object<_RTL_OSVERSIONINFOEXW> version_information) -> NTSTATUS
 		{

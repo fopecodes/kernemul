@@ -288,6 +288,109 @@ void modules::register_ntoskrnl_string_ops(win_kernel_state& state, proc_module&
 			return STATUS_SUCCESS;
 		});
 
+	state.redirect(mod, "RtlCopyUnicodeString",
+		[](vcpu& cpu, emu_object<_UNICODE_STRING> destination,
+			emu_object<_UNICODE_STRING> source) -> NTSTATUS
+		{
+			if (!destination)
+				return STATUS_INVALID_PARAMETER;
+
+			auto& space = *cpu.curr_addr_space();
+			auto out = destination.read();
+			const auto wide = win::read_unicode_string(source);
+
+			// Real RTL copies whole characters only and leaves the buffer
+			// terminator-agnostic; the spare WCHAR is never written.
+			const auto capacity = out.MaximumLength >= sizeof(char16_t)
+				? out.MaximumLength - sizeof(char16_t)
+				: 0;
+			const auto chars = std::min<std::size_t>(wide.size(), capacity / sizeof(char16_t));
+
+			if (guest_va(out.Buffer) && chars)
+				space.write_mem(guest_va(out.Buffer), wide.data(), chars * sizeof(char16_t));
+
+			out.Length = static_cast<unsigned short>(chars * sizeof(char16_t));
+			destination.write(out);
+
+			const auto truncated = chars < wide.size();
+
+			THREAD_LOG_INFO("RtlCopyUnicodeString(dest=0x{:X}, src='{}'){}",
+				destination.address(), narrow_wstring(wide), truncated ? " truncated" : "");
+
+			return truncated ? STATUS_BUFFER_OVERFLOW : STATUS_SUCCESS;
+		});
+
+	state.redirect(mod, "RtlUnicodeStringToAnsiString",
+		[st](vcpu& cpu, emu_object<_STRING> destination, emu_object<_UNICODE_STRING> source,
+			const std::uint8_t allocate) -> NTSTATUS
+		{
+			if (!destination)
+				return STATUS_INVALID_PARAMETER;
+
+			auto& space = *cpu.curr_addr_space();
+			const auto narrow = narrow_wstring(win::read_unicode_string(source));
+
+			auto out = destination.read();
+			auto buffer = guest_va(out.Buffer);
+
+			if (allocate)
+			{
+				buffer = st->pool.allocate(narrow.size() + 1, string_pool_tag, true);
+
+				if (!buffer)
+					return STATUS_NO_MEMORY;
+
+				out.Buffer = guest_ptr<char>(buffer);
+				out.MaximumLength = static_cast<unsigned short>(narrow.size() + 1);
+			}
+
+			if (!buffer)
+				return STATUS_INVALID_PARAMETER;
+
+			// ANSI strings are counted but callers expect the NUL, so it eats one byte.
+			const auto capacity = out.MaximumLength ? out.MaximumLength - 1 : 0;
+			const auto copied = std::min<std::size_t>(narrow.size(), capacity);
+
+			if (copied)
+				space.write_mem(buffer, narrow.data(), copied);
+
+			space.write_mem<char>(buffer + copied, 0);
+
+			out.Length = static_cast<unsigned short>(copied);
+			destination.write(out);
+
+			const auto truncated = copied < narrow.size();
+
+			THREAD_LOG_INFO("RtlUnicodeStringToAnsiString(dest=0x{:X}, src='{}', alloc={}): len={}{}",
+				destination.address(), narrow, allocate ? 1 : 0, copied,
+				truncated ? " truncated" : "");
+
+			return truncated ? STATUS_BUFFER_OVERFLOW : STATUS_SUCCESS;
+		});
+
+	state.redirect(mod, "RtlFreeAnsiString",
+		[st](vcpu&, emu_object<_STRING> ansi_string)
+		{
+			if (!ansi_string)
+				return;
+
+			const auto str = ansi_string.read();
+			const auto buffer = guest_va(str.Buffer);
+
+			if (!buffer)
+				return;
+
+			ansi_string.write(_STRING{});
+
+			if (!st->pool.free(buffer))
+			{
+				THREAD_LOG_ERR("RtlFreeAnsiString: 0x{:X} is not a live pool allocation", buffer);
+				return;
+			}
+
+			THREAD_LOG_INFO("RtlFreeAnsiString(0x{:X})", buffer);
+		});
+
 	// Folded onto RtlFreeAnsiString and RtlFreeUTF8String on both architectures.
 	state.redirect(mod, "RtlFreeUnicodeString",
 		[st](vcpu&, emu_object<_UNICODE_STRING> unicode_string)

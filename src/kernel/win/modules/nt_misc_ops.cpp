@@ -5,6 +5,7 @@
 #include "../pool.hpp"
 #include "../status.hpp"
 #include "../string.hpp"
+#include "../process.hpp"
 #include "../thread.hpp"
 #include "../types.hpp"
 #include "../../../emu/guest_call.hpp"
@@ -393,8 +394,7 @@ void modules::register_ntoskrnl_misc_ops(win_kernel_state& state, proc_module& m
 				registrations.size());
 		});
 
-	state.redirect(mod, "IoCreateDevice",
-		[st](vcpu& cpu, emu_object<_DRIVER_OBJECT> driver_object,
+	const auto create_device = [st](vcpu& cpu, emu_object<_DRIVER_OBJECT> driver_object,
 			const std::uint32_t device_extension_size,
 			emu_object<_UNICODE_STRING> device_name,
 			const std::uint32_t device_type, const std::uint32_t device_characteristics,
@@ -453,6 +453,38 @@ void modules::register_ntoskrnl_misc_ops(win_kernel_state& state, proc_module& m
 			THREAD_LOG_INFO("IoCreateDevice(driver=0x{:X}, extension_size=0x{:X}, name='{}', type=0x{:X}, characteristics=0x{:X}, exclusive={}) -> 0x{:X}",
 				driver_object.address(), device_extension_size, narrow_wstring(name),
 				device_type, device_characteristics, exclusive, addr);
+
+			return STATUS_SUCCESS;
+	};
+
+	state.redirect(mod, "IoCreateDevice", create_device);
+
+	// Protected drivers resolve this at runtime (NEProtect probes it through
+	// MmGetSystemRoutineAddress), so a static-import-only picture misses it.
+	// Creation is the same device object; the SDDL and class GUID gate later
+	// opens, not the creation itself.
+	state.redirect(mod, "IoCreateDeviceSecure",
+		[create_device](vcpu& cpu, emu_object<_DRIVER_OBJECT> driver_object,
+			const std::uint32_t device_extension_size,
+			emu_object<_UNICODE_STRING> device_name,
+			const std::uint32_t device_type, const std::uint32_t device_characteristics,
+			const bool exclusive, emu_object<_UNICODE_STRING> default_sddl,
+			const addr_t device_class_guid, emu_object<addr_t> device_object_out) -> NTSTATUS
+		{
+			THREAD_LOG_INFO("IoCreateDeviceSecure: SDDL='{}', class_guid=0x{:X}",
+				narrow_wstring(win::read_unicode_string(default_sddl)), device_class_guid);
+
+			return create_device(cpu, driver_object, device_extension_size, device_name,
+				device_type, device_characteristics, exclusive, device_object_out);
+		});
+
+	state.redirect(mod, "IoValidateDeviceIoControlAccess",
+		[](vcpu&, const addr_t irp, const std::uint32_t required_access) -> NTSTATUS
+		{
+			// Real Windows grants kernel-mode requestors automatically; here
+			// every requestor is granted, which is what an init-time probe wants.
+			THREAD_LOG_INFO("IoValidateDeviceIoControlAccess(irp=0x{:X}, required_access=0x{:X}) -> granted",
+				irp, required_access);
 
 			return STATUS_SUCCESS;
 		});
@@ -685,6 +717,18 @@ void modules::register_ntoskrnl_misc_ops(win_kernel_state& state, proc_module& m
 			return 0;
 		});
 
+	// No bus here either; the write is dropped and zero bytes reported.
+	state.redirect(mod, "HalSetBusDataByOffset",
+		[](vcpu&, const std::uint32_t bus_data_type, const std::uint32_t bus_number,
+			const std::uint32_t slot_number, const addr_t buffer,
+			const std::uint32_t offset, const std::uint32_t length) -> std::uint32_t
+		{
+			THREAD_LOG_WARN("HalSetBusDataByOffset(type={}, bus={}, slot={}, buffer=0x{:X}, offset={}, length={}): no bus -> 0 bytes",
+				bus_data_type, bus_number, slot_number, buffer, offset, length);
+
+			return 0;
+		});
+
 	// Not an ntoskrnl export -- imported from hal, which is not mapped; binds by PDB symbol.
 	state.redirect(mod, "HalPutDmaAdapter",
 		[st](vcpu&, const addr_t dma_adapter)
@@ -808,6 +852,29 @@ void modules::register_ntoskrnl_misc_ops(win_kernel_state& state, proc_module& m
 				access_mode, parse_context);
 
 			return STATUS_OBJECT_NAME_NOT_FOUND;
+		});
+
+	state.redirect(mod, "RtlImageNtHeader",
+		[](vcpu& cpu, const addr_t image_base) -> addr_t
+		{
+			if (!image_base)
+				return 0;
+
+			auto& space = *cpu.curr_addr_space();
+
+			if (space.read_mem<char>(image_base) != 'M' || space.read_mem<char>(image_base + 1) != 'Z')
+			{
+				THREAD_LOG_WARN("RtlImageNtHeader(0x{:X}): no MZ", image_base);
+				return 0;
+			}
+
+			const auto e_lfanew = space.read_mem<std::uint32_t>(image_base + 0x3C);
+			const auto nt = image_base + e_lfanew;
+			const auto ok = space.read_mem<std::uint32_t>(nt) == 0x00004550; // PE\0\0
+
+			THREAD_LOG_INFO("RtlImageNtHeader(0x{:X}) -> 0x{:X}", image_base, ok ? nt : 0);
+
+			return ok ? nt : 0;
 		});
 
 	state.redirect(mod, "RtlPcToFileHeader",
@@ -1064,6 +1131,73 @@ void modules::register_ntoskrnl_misc_ops(win_kernel_state& state, proc_module& m
 				else
 				{
 					THREAD_LOG_ERR("  parameter[{}] = 0x{:X}", i, value);
+				}
+			}
+
+			// --- debug: on init-failure, dump PEB.Ldr InInitializationOrderModuleList ---
+			// 0xC0000142 = STATUS_DLL_INIT_FAILED, 0xC0000145 = STATUS_APP_INIT_FAILURE,
+			// 0xC0000005 = ACCESS_VIOLATION. Dump the init list for any of these during init.
+			const bool is_init_fail =
+				error_status == 0xC0000142 || error_status == 0xC0000145 ||
+				error_status == 0xC0000005;
+			if (is_init_fail && cpu.thread())
+			{
+				if (const auto up = std::dynamic_pointer_cast<win_user_proc>(cpu.thread()->proc()))
+				{
+					try
+					{
+						// Read PEB.Ldr directly from guest memory (field accessor types
+						// get awkward with the pointer-typed PEB struct members).
+						const addr_t peb_addr = up->peb().address();
+						const addr_t ldr_addr = space.read_mem<addr_t>(
+							peb_addr + offsetof(_PEB64, Ldr));
+						THREAD_LOG_ERR("=== PEB.Ldr = 0x{:X} - InInitializationOrderModuleList ===",
+							ldr_addr);
+
+						const addr_t head_addr = ldr_addr +
+							offsetof(_PEB_LDR_DATA, InInitializationOrderModuleList);
+						addr_t cur = space.read_mem<addr_t>(head_addr);
+						int seen = 0;
+						while (cur && cur != head_addr && seen < 64)
+						{
+							const addr_t entry_addr = cur -
+								offsetof(_LDR_DATA_TABLE_ENTRY, InInitializationOrderLinks);
+							const auto dll_base_p = space.read_mem<addr_t>(entry_addr +
+								offsetof(_LDR_DATA_TABLE_ENTRY, DllBase));
+							const auto entry_point_p = space.read_mem<addr_t>(entry_addr +
+								offsetof(_LDR_DATA_TABLE_ENTRY, EntryPoint));
+							const auto size_of_image = space.read_mem<std::uint32_t>(entry_addr +
+								offsetof(_LDR_DATA_TABLE_ENTRY, SizeOfImage));
+							const auto flags = space.read_mem<std::uint32_t>(entry_addr +
+								offsetof(_LDR_DATA_TABLE_ENTRY, Flags));
+
+							const auto name_struct_addr = entry_addr +
+								offsetof(_LDR_DATA_TABLE_ENTRY, BaseDllName);
+							const emu_object<_UNICODE_STRING> name_us(space, name_struct_addr);
+							const auto name = narrow_wstring(win::read_unicode_string(name_us));
+
+							const bool pac = (flags & 0x80000) != 0;
+							const bool paf = (flags & 0x100000) != 0;
+							const bool ep = (flags & 0x4000) != 0;
+							THREAD_LOG_ERR("  [{}] '{}' base=0x{:X} ep=0x{:X} size=0x{:X} "
+								"flags=0x{:X} ({}{}{})",
+								seen, name,
+								static_cast<addr_t>(dll_base_p),
+								static_cast<addr_t>(entry_point_p),
+								size_of_image, flags,
+								ep ? "EntryProcessed " : "",
+								pac ? "ProcessAttachCalled " : "",
+								paf ? "ProcessAttachFailed" : "");
+
+							cur = space.read_mem<addr_t>(cur);
+							++seen;
+						}
+						THREAD_LOG_ERR("=== PEB.Ldr dump complete ({} entries) ===", seen);
+					}
+					catch (const std::exception& ex)
+					{
+						THREAD_LOG_ERR("PEB.Ldr dump failed: {}", ex.what());
+					}
 				}
 			}
 
